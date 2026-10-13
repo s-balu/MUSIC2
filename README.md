@@ -37,6 +37,47 @@ If you want to build on macOS, then it is strongly recommended to use GNU (or In
 ```
 This is necessary since Apple's compilers haven't supported OpenMP for years.
 
+### Nyx output with AMReX
+
+Enable the Nyx output plugin with `-DENABLE_NYX=ON`. It requires a separate
+3D, double-precision, CPU-only AMReX library built without MPI. Nyx itself
+can still use MPI and GPUs. A GNU Make build of Nyx/AMReX does not supply
+the CMake package required by MUSIC.
+
+From the MUSIC source directory, build and install AMReX using the same
+C++ compiler as MUSIC (replace `/path/to/amrex` with your AMReX source path):
+
+```sh
+cmake -S /path/to/amrex -B build/amrex \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$PWD/build/amrex-install" \
+  -DAMReX_SPACEDIM=3 -DAMReX_PRECISION=DOUBLE \
+  -DAMReX_MPI=OFF -DAMReX_GPU_BACKEND=NONE \
+  -DAMReX_FORTRAN=OFF -DAMReX_PARTICLES=OFF \
+  -DAMReX_AMRLEVEL=OFF -DAMReX_LINEAR_SOLVERS=OFF
+cmake --build build/amrex -j4
+cmake --install build/amrex
+
+cmake -S . -B build/music-nyx \
+  -DENABLE_NYX=ON -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$PWD/build/amrex-install"
+cmake --build build/music-nyx -j4
+```
+
+If AMReX is already installed, pass its installation prefix in
+`CMAKE_PREFIX_PATH`, or set `AMReX_DIR` to the directory containing
+`AMReXConfig.cmake`. FFTW, GSL and OpenMP are still required by MUSIC.
+The default MUSIC build also enables CLASS and PANPHASIA; disable them with
+`-DENABLE_CLASS=OFF -DENABLE_PANPHASIA=OFF` if they are not needed.
+
+In your MUSIC parameter file, set `format = nyx` and `filename = init` in
+`[output]`, and add `blocking_factor = 8` in `[setup]`. The plugin writes
+`init/Level_*/Cell`, a header, a grids file, and sample Nyx `inputs`/`probin`
+files in the working directory. Use Nyx's MUSIC reader with
+`nyx.particle_init_type = Cosmological`, `cosmo.ic-source = MUSIC` and
+`cosmo.initDirName = init`. The sample inputs need the runtime settings
+appropriate to your Nyx build.
+
 
 ## Running
 There is an example parameter file 'example.conf' in the main directory. Possible options are explained in it, it can be run as a simple argument, e.g. from within the build directory:

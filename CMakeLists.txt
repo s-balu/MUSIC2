@@ -159,6 +159,26 @@ add_executable(${PRGNAME} ${SOURCES} ${PLUGINS})
 
 set_target_properties(${PRGNAME} PROPERTIES CXX_STANDARD 17)
 
+# Nyx ICs use AMReX MultiFab files. MUSIC itself runs on one process and
+# copies host-resident grids, so use a CPU-only, non-MPI AMReX library.
+option(ENABLE_NYX "Enable AMReX-based Nyx output" OFF)
+if(ENABLE_NYX)
+  find_package(AMReX CONFIG REQUIRED COMPONENTS 3D DOUBLE)
+  if(AMReX_MPI OR AMReX_MPI_FOUND)
+    message(FATAL_ERROR "Nyx output requires AMReX built with AMReX_MPI=OFF")
+  endif()
+  if(NOT AMReX_GPU_BACKEND STREQUAL "NONE")
+    message(FATAL_ERROR "Nyx output requires AMReX built with AMReX_GPU_BACKEND=NONE")
+  endif()
+  target_sources(${PRGNAME} PRIVATE src/plugins/nyx_plugin/output_nyx.cpp)
+  if(TARGET AMReX::amrex_3d)
+    target_link_libraries(${PRGNAME} PRIVATE AMReX::amrex_3d)
+  else()
+    target_link_libraries(${PRGNAME} PRIVATE AMReX::amrex)
+  endif()
+  target_compile_definitions(${PRGNAME} PRIVATE HAVE_AMREX)
+endif()
+
 if(CODE_PRECISION STREQUAL "FLOAT")
   if(FFTW3_SINGLE_THREADS_FOUND)
     target_link_libraries(${PRGNAME} PRIVATE FFTW3::FFTW3_SINGLE_THREADS)

@@ -9,25 +9,43 @@
  
  */
 
-#ifdef HAVE_BOXLIB
+#ifdef HAVE_AMREX
 
 
 #include "../../output.hh"
 
-#include <VisMF.H>
-#include <Box.H>
-#include <RealBox.H>
-#include <ParallelDescriptor.H>
-#include <Utility.H>
-#include <PArray.H>
+#include <AMReX.H>
+#include <AMReX_VisMF.H>
+#include <AMReX_MultiFab.H>
+#include <AMReX_Box.H>
+#include <AMReX_RealBox.H>
+#include <AMReX_ParallelDescriptor.H>
+#include <AMReX_Utility.H>
+#include <limits>
+#include <memory>
 
-#define MAX_GRID_SIZE	32
-#define BL_SPACEDIM 3
+#if AMREX_SPACEDIM != 3 || defined(AMREX_USE_MPI) || defined(AMREX_USE_GPU)
+#error "Nyx output requires a 3D, CPU-only, non-MPI AMReX build"
+#endif
+
+using namespace amrex;
 
 
 class nyx_output_plugin : public output_plugin
 {
 protected:
+    // Declared before the MultiFabs so they are destroyed before AMReX.
+    struct amrex_runtime {
+        AMReX* instance;
+        amrex_runtime() {
+            int argc = 1;
+            char name[] = "MUSIC";
+            char* args[] = {name, nullptr};
+            char** argv = args;
+            instance = amrex::Initialize(argc, argv, false);
+        }
+        ~amrex_runtime() { amrex::Finalize(instance); }
+    } runtime_;
 	
 	struct patch_header{
 		int component_rank;
@@ -63,7 +81,7 @@ protected:
 	int f_lev;
 	int gridp;
 	
-	PArray<MultiFab> mfs;
+	std::vector<std::unique_ptr<MultiFab>> mfs;
 
 //	std::vector<grid_on_one_level> grids;
 
@@ -74,74 +92,37 @@ protected:
 
 	
 	
-	void dump_grid_data(int comp, std::string fieldname, const grid_hierarchy& gh, double factor = 1.0, double add = 0.0 )
-	{
-		std::cout << fieldname << " is dumped... to mf index " << comp << std::endl;
+    void dump_grid_data(int comp, const std::string& fieldname,
+                        const grid_hierarchy& gh, double factor = 1.0, double add = 0.0)
+    {
+        music::ilog.Print("Writing Nyx field %s", fieldname.c_str());
+        for (unsigned mlevel = levelmin_; mlevel <= levelmax_; ++mlevel) {
+            const int blevel = mlevel - levelmin_;
+            const auto* grid = gh.get_grid(mlevel);
+            const auto lo = boxes[blevel].smallEnd();
+            for (int d = 0; d < 3; ++d) {
+                if (grid->size(d) != static_cast<size_t>(boxes[blevel].length(d)))
+                    throw std::runtime_error("Nyx output grid dimensions do not match the hierarchy");
+            }
+            for (MFIter mfi(*mfs[blevel]); mfi.isValid(); ++mfi) {
+                const auto data = mfs[blevel]->array(mfi);
+                const Box& box = mfi.validbox();
+                // Each index is computed locally so the loop is safe with OpenMP.
+                #pragma omp parallel for
+                for (int k = box.smallEnd(2); k <= box.bigEnd(2); ++k)
+                    for (int j = box.smallEnd(1); j <= box.bigEnd(1); ++j)
+                        for (int i = box.smallEnd(0); i <= box.bigEnd(0); ++i)
+                            data(i, j, k, comp) =
+                                (add + (*grid)(i-lo[0], j-lo[1], k-lo[2])) * factor;
+            }
+        }
+    }
 
-		//FIXME adapt for multiple levels!
-		for(int mlevel=levelmin_; mlevel<=levelmax_; ++mlevel )
-		{
-			int blevel = mlevel-levelmin_;
-
-			std::vector<int> ng;
-			ng.push_back( gh.get_grid(mlevel)->size(0) );
-			ng.push_back( gh.get_grid(mlevel)->size(1) );
-			ng.push_back( gh.get_grid(mlevel)->size(2) );
-			
-			std::cout << ng[0] << " " << ng[1] << " " << ng[2] << std::endl;
-	
-			//write data to mf
-			for(MFIter mfi(mfs[blevel]); mfi.isValid(); ++mfi) {
-			    FArrayBox &myFab = mfs[blevel][mfi];	
-			    const int  *fab_lo = mfi.validbox().loVect();
-			    const int  *fab_hi = mfi.validbox().hiVect();
-	
-			    int mk = fab_lo[2] - boxes[blevel].smallEnd()[2];
-	#ifdef OMP		    
-			    #pragma omp parallel for default(shared)
-	#endif
-			    for (int k = fab_lo[2]; k <= fab_hi[2]; k++, mk++) {
-
-			      int mj = fab_lo[1] - boxes[blevel].smallEnd()[1];
-			      for (int j = fab_lo[1]; j <= fab_hi[1]; j++, mj++) {
-
-				int mi = fab_lo[0] - boxes[blevel].smallEnd()[0];
-			    	for (int i = fab_lo[0]; i <= fab_hi[0]; i++, mi++) {
-				  if (mi>=ng[0])
-					  std::cout << "mi (" << mi << ") too large " << ng[0] << std::endl;
-				  if (mj>=ng[1])
-					  std::cout << "mj (" << mj << ") too large " << ng[1] << std::endl;
-				  if (mk>=ng[2])
-					  std::cout << "mk (" << mk << ") too large " << ng[2] << std::endl;
-	
-				  IntVect iv(i,j,k);
-				  double data = ( add + (*gh.get_grid(mlevel))(mi,mj,mk) )*factor;
-				  int idx = myFab.box().index(iv);
-				  myFab.dataPtr(comp)[idx] = data;
-
-//				  mi++;
-			    	}
-//				mj++;
-			      }
-//			      mk++;
-			    }
-			} // MFI
-		}
-		
-	//	char nyxname[256], filename[256];
-	//	
-	//	for(unsigned ilevel=levelmin_; ilevel<=levelmax_; ++ilevel )
-	//	{
-	}
-	
 public:
 	
 	nyx_output_plugin( config_file& cf )
 	: output_plugin( cf )
 	{ 
-		int argc=1;
-		char **argv;
-		BoxLib::Initialize(argc,argv);
 
 		bool bhave_hydro = cf_.get_value<bool>("setup","baryons");
 
@@ -181,21 +162,19 @@ public:
 
 		mfs.resize(f_lev+1);
 
-		Array<int> pmap(2);
+		Vector<int> pmap(2);
 		pmap[0]=0;
 		pmap[1]=0;
 
 		gridp = 1<<levelmin_;
 
-		double off[] = {0, 0, 0};
+		int off[] = {0, 0, 0};
 
 		//at first we do this only for the topgrid...
 		for(int lev = 0; lev <= f_lev; lev++)
 		{
-			BoxArray   domainBoxArray(1);
+			BoxArray   domainBoxArray;
 			
-			int mlev = lev+levelmin_;
-			int fac  = (1<<lev);
 
 //			off[0] += fac*offx_[lev];
 //			off[1] += fac*offy_[lev];
@@ -228,7 +207,7 @@ public:
 			Box        probDomain(pdLo,pdHi);
 			
 			// We just have one box since we don't use mpi.
-		   	domainBoxArray.set(0, probDomain);
+            domainBoxArray = BoxArray(probDomain);
 			domainBoxArray.maxSize(32);
 			pmap.resize(domainBoxArray.size(),0);
 			
@@ -237,10 +216,8 @@ public:
 			boxarrays.push_back(domainBoxArray);
 			boxes.push_back(probDomain);
 	
-			int ngrow(0);
-			MultiFab *mf = new MultiFab;
-			mfs.set(lev,mf);
-			mfs[lev].define(domainBoxArray, n_data_items, ngrow, domainDistMap, Fab_allocate);
+            mfs[lev] = std::make_unique<MultiFab>(domainBoxArray, domainDistMap, n_data_items, 0);
+            mfs[lev]->setVal(0.0);
 		}
 
 //		if( mkdir( fname_.c_str(), 0777 ) )
@@ -282,15 +259,17 @@ public:
 		std::cout << "creating output object"  << std::endl;
 	}
 	
-	~nyx_output_plugin()
+	void write_multifabs()
 	{
 		std::string FullPath = fname_;
-		if (!BoxLib::UtilCreateDirectory(FullPath, 0755))
-			BoxLib::CreateDirectoryFailed(FullPath);
+		if (!amrex::UtilCreateDirectory(FullPath, 0755))
+			amrex::CreateDirectoryFailed(FullPath);
 		if (!FullPath.empty() && FullPath[FullPath.size()-1] != '/')
 			FullPath += '/';
 		FullPath += "Header";
 		std::ofstream Header(FullPath.c_str());
+        if (!Header) throw std::runtime_error("Cannot write Nyx Header: " + FullPath);
+        Header << std::setprecision(std::numeric_limits<double>::max_digits10);
 
 		for(int lev=0; lev <= f_lev; lev++)
 		{
@@ -303,7 +282,6 @@ public:
 		Header.close();
 
 		writeGridsFile(fname_);
-		std::cout << "destroying output object"  << std::endl;
 	}
 	
 	void write_dm_mass( const grid_hierarchy& gh )
@@ -322,7 +300,6 @@ public:
 		char nyxname[256];
 		snprintf( nyxname, 256, "ParticleVelocities_%c", (char)('x'+coord) );
 		
-		double vunit = 1.0/(1.225e2*sqrt(the_sim_header.omega_m/the_sim_header.a_start));
 		
 		dump_grid_data(the_sim_header.particle_idx+3+coord, nyxname, gh);
 	}
@@ -346,7 +323,6 @@ public:
 	
 	void write_gas_velocity( int coord, const grid_hierarchy& gh )
 	{
-		double vunit = 1.0/(1.225e2*sqrt(the_sim_header.omega_m/the_sim_header.a_start));
 		
 		char nyxname[256];
 		snprintf( nyxname, 256, "GridVelocities_%c", (char)('x'+coord) );
@@ -372,6 +348,7 @@ public:
 	
 	void finalize( void )
 	{
+		write_multifabs();
 		//
 		//before finalizing we write out an inputs and a probin file for Nyx.
 		//
@@ -404,7 +381,7 @@ public:
 		inputs << "particles.v           = 1       # verbosity in Particle class" << std::endl;
 		inputs << "amr.ref_ratio       = 2 2 2 2 2 2 2 2 " << std::endl;
 		inputs << "amr.regrid_int      = 2 2 2 2 2 2 2 2 " << std::endl;
-		inputs << "amr.initial_grid_file = init/grids_file" << std::endl;
+		inputs << "amr.initial_grid_file = \"" << fname_ << "/grids_file\"" << std::endl;
 		inputs << "amr.useFixedCoarseGrids = 1" << std::endl;
 		inputs << "amr.check_file      = chk " << std::endl;
 		inputs << "amr.check_int       = 10 " << std::endl;
@@ -426,9 +403,11 @@ public:
 		inputs << "nyx.do_dm_particles = 1               " << std::endl;
 		inputs << "nyx.particle_init_type = Cosmological " << std::endl;
                 inputs << "nyx.print_fortran_warnings = 0" << std::endl;
-		inputs << "cosmo.initDirName  = init             " << std::endl;
+		inputs << "cosmo.initDirName = \"" << fname_ << "\"" << std::endl;
 		inputs << "nyx.particle_move_type = Gravitational" << std::endl;
-		inputs << "amr.probin_file = probin              " << std::endl;
+		inputs << "nyx.comoving_OmM = " << the_sim_header.omega_m << std::endl;
+        inputs << "nyx.comoving_OmB = " << the_sim_header.omega_b << std::endl;
+        inputs << "nyx.comoving_h = " << the_sim_header.h0 << std::endl;
 		inputs << "cosmo.ic-source = MUSIC               " << std::endl;
 		
 
@@ -464,7 +443,6 @@ public:
 	{
 		int i, n;
 		
-		const Real cur_time = 0.0;
 
 		std::cout << "in writeLevelPlotFile" << std::endl;
 		double h0 = cf_.get_value<double>("cosmology", "H0")*0.01;
@@ -492,11 +470,11 @@ public:
 		
 			os << f_lev << '\n';
 		
-			for (i = 0; i < BL_SPACEDIM; i++)
+			for (i = 0; i < AMREX_SPACEDIM; i++)
 				os << 0 << ' '; //ProbLo
 			os << '\n';
 			double boxlength = cf_.get_value<double>("setup","boxlength");
-			for (i = 0; i < BL_SPACEDIM; i++)
+			for (i = 0; i < AMREX_SPACEDIM; i++)
 				os << boxlength/h0 << ' '; //ProbHi
 			os << '\n';
 		
@@ -525,7 +503,7 @@ public:
 			double dx = cf_.get_value<double>("setup","boxlength")/gridp/h0;
 			for (i = 0; i <= f_lev; i++)
 			{
-				for (int k = 0; k < BL_SPACEDIM; k++)
+				for (int k = 0; k < AMREX_SPACEDIM; k++)
 					os << dx << ' ';
 				os << '\n';
 				dx = dx/2.;
@@ -540,7 +518,7 @@ public:
 		//
 		static const std::string BaseName = "/Cell";
 		
-		std::string Level = BoxLib::Concatenate("Level_", level, 1);
+		std::string Level = amrex::Concatenate("Level_", level, 1);
 		//
 		// Now for the full pathname of that directory.
 		//
@@ -551,21 +529,21 @@ public:
 		//
 		// Only the I/O processor makes the directory if it doesn't already exist.
 		//
-		if (!BoxLib::UtilCreateDirectory(FullPath, 0755))
-			BoxLib::CreateDirectoryFailed(FullPath);
+		if (!amrex::UtilCreateDirectory(FullPath, 0755))
+			amrex::CreateDirectoryFailed(FullPath);
 		
 		os << level << ' ' << boxarrays[level].size() << ' ' << 0 << '\n';
 		os << 0 << '\n';
 	
 		double cellsize[3];
 		double dx = cf_.get_value<double>("setup","boxlength")/gridp/h0;
-		for (n = 0; n < BL_SPACEDIM; n++)
+		for (n = 0; n < AMREX_SPACEDIM; n++)
 		{
 			cellsize[n] = dx;
 		}
 		for (i = 0; i < level; i++)
 		{
-			for (n = 0; n < BL_SPACEDIM; n++)
+			for (n = 0; n < AMREX_SPACEDIM; n++)
 			{
 				cellsize[n] /= 2.;
 			}
@@ -576,7 +554,7 @@ public:
 			double problo[] = {0,0,0};
 			std::cout << boxarrays[level][i] << std::endl;
 			RealBox gridloc = RealBox(boxarrays[level][i], cellsize, problo);
-			for (n = 0; n < BL_SPACEDIM; n++)
+			for (n = 0; n < AMREX_SPACEDIM; n++)
 				os << gridloc.lo(n) << ' ' << gridloc.hi(n) << '\n';
 		}
 		//
@@ -593,12 +571,12 @@ public:
 		//
 		std::string TheFullPath = FullPath;
 		TheFullPath += BaseName;
-		VisMF::Write(mfs[level],TheFullPath,how,true);
+		VisMF::Write(*mfs[level],TheFullPath,how,true);
 	}
 
 	void writeGridsFile (const	std::string&	dir)
 	{
-		int i, n;
+		int i;
 
 		std::cout << "in writeGridsFile" << std::endl;
 		
@@ -614,9 +592,10 @@ public:
 		for (int lev = 1; lev <= f_lev; lev++)
 		{
 			os << boxarrays[lev].size() << '\n';
-			boxarrays[lev].coarsen(2);
-			for (i=0; i < boxarrays[lev].size(); i++)
-				os << boxarrays[lev][i] << "\n";
+            BoxArray coarse_boxes = boxarrays[lev];
+            coarse_boxes.coarsen(2);
+            for (i=0; i < coarse_boxes.size(); i++)
+                os << coarse_boxes[i] << "\n";
 		}
 		os.close();
 	}
@@ -650,5 +629,5 @@ namespace{
 	output_plugin_creator_concrete<nyx_output_plugin> creator("nyx");
 }
 
-#endif //HAVE_BOXLIB
+#endif //HAVE_AMREX
 
